@@ -510,51 +510,73 @@ impl Optimizer {
                     .enumerate()
                     .filter(|(_, v)| **v)
                     .map(|(i, _)| i)
-                    .min_by_key(|i| estimate_graph_pattern_size(&to_reorder[*i], input_types))
+                    .min_by_key(|i| {
+                        (
+                            !is_service_name_bound(&to_reorder[*i], input_types),
+                            estimate_graph_pattern_size(&to_reorder[*i], input_types),
+                        )
+                    })
                 {
                     not_yet_reordered_ids[next_entry_id] = false; // It's now done
                     let mut output = to_reorder[next_entry_id].clone();
                     let mut output_types = to_reorder_types[next_entry_id].clone();
                     // We look for an other child to join with that does not blow up the join cost
-                    while let Some(next_id) = not_yet_reordered_ids
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, v)| **v)
-                        .map(|(i, _)| i)
-                        .filter(|i| {
-                            has_common_variables(&output_types, &to_reorder_types[*i], input_types)
-                        })
-                        .min_by_key(|i| {
-                            // Estimation of the join cost
-                            if cfg!(feature = "sep-0006")
-                                && is_fit_for_for_loop_join(
-                                    &to_reorder[*i],
-                                    input_types,
+                    loop {
+                        // The name variables of the SERVICEs still waiting for them to be bound
+                        let pending_names = not_yet_reordered_ids
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| **v)
+                            .flat_map(|(i, _)| unbound_service_names(&to_reorder[i], &output_types))
+                            .collect::<Vec<_>>();
+                        let Some(next_id) = not_yet_reordered_ids
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| **v)
+                            .map(|(i, _)| i)
+                            .filter(|i| {
+                                has_common_variables(
                                     &output_types,
-                                )
-                            {
-                                estimate_lateral_cost(
-                                    &output,
-                                    &output_types,
-                                    &to_reorder[*i],
+                                    &to_reorder_types[*i],
                                     input_types,
-                                )
-                            } else {
-                                estimate_join_cost(
-                                    &output,
-                                    &to_reorder[*i],
-                                    &JoinAlgorithm::HashBuildLeftProbeRight {
-                                        keys: join_key_variables(
-                                            &output_types,
-                                            &to_reorder_types[*i],
-                                            input_types,
-                                        ),
-                                    },
-                                    input_types,
-                                )
-                            }
-                        })
-                    {
+                                ) || pending_names.iter().any(|name| {
+                                    is_named_node_pattern_bound(name, &to_reorder_types[*i])
+                                })
+                            })
+                            .min_by_key(|i| {
+                                // Estimation of the join cost
+                                let cost = if cfg!(feature = "sep-0006")
+                                    && is_fit_for_for_loop_join(
+                                        &to_reorder[*i],
+                                        input_types,
+                                        &output_types,
+                                    ) {
+                                    estimate_lateral_cost(
+                                        &output,
+                                        &output_types,
+                                        &to_reorder[*i],
+                                        input_types,
+                                    )
+                                } else {
+                                    estimate_join_cost(
+                                        &output,
+                                        &to_reorder[*i],
+                                        &JoinAlgorithm::HashBuildLeftProbeRight {
+                                            keys: join_key_variables(
+                                                &output_types,
+                                                &to_reorder_types[*i],
+                                                input_types,
+                                            ),
+                                        },
+                                        input_types,
+                                    )
+                                };
+                                // A SERVICE waits for the operand binding its name
+                                (!is_service_name_bound(&to_reorder[*i], &output_types), cost)
+                            })
+                        else {
+                            break;
+                        };
                         not_yet_reordered_ids[next_id] = false; // It's now done
                         let next = to_reorder[next_id].clone();
                         #[cfg(feature = "sep-0006")]
@@ -961,8 +983,8 @@ fn estimate_graph_pattern_size(pattern: &GraphPattern, input_types: &VariableTyp
         | GraphPattern::Project { inner, .. }
         | GraphPattern::Distinct { inner, .. }
         | GraphPattern::Reduced { inner, .. }
-        | GraphPattern::Group { inner, .. }
-        | GraphPattern::Service { inner, .. } => estimate_graph_pattern_size(inner, input_types),
+        | GraphPattern::Group { inner, .. } => estimate_graph_pattern_size(inner, input_types),
+        GraphPattern::Service { inner, .. } => estimate_service_size(inner, input_types),
         GraphPattern::Slice {
             inner,
             start,
@@ -975,6 +997,77 @@ fn estimate_graph_pattern_size(pattern: &GraphPattern, input_types: &VariableTyp
                 inner
             }
         }
+    }
+}
+
+/// Whether `pattern`, if it is a SERVICE (or a FILTER, BIND or UNION of them), can be called: its
+/// name is an IRI or a variable bound by `types`.
+fn is_service_name_bound(pattern: &GraphPattern, types: &VariableTypes) -> bool {
+    match pattern {
+        GraphPattern::Service { name, .. } => is_named_node_pattern_bound(name, types),
+        GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
+            is_service_name_bound(inner, types)
+        }
+        GraphPattern::Union { inner } => inner.iter().all(|i| is_service_name_bound(i, types)),
+        _ => true,
+    }
+}
+
+/// The name variables of `pattern`'s SERVICEs (see `is_service_name_bound`) unbound in `types`.
+fn unbound_service_names(pattern: &GraphPattern, types: &VariableTypes) -> Vec<NamedNodePattern> {
+    match pattern {
+        GraphPattern::Service { name, .. } if !is_named_node_pattern_bound(name, types) => {
+            vec![name.clone()]
+        }
+        GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
+            unbound_service_names(inner, types)
+        }
+        GraphPattern::Union { inner } => inner
+            .iter()
+            .flat_map(|i| unbound_service_names(i, types))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A SERVICE's size, by its most selective pattern: the remote endpoint joins its body
+/// itself, so a body anchored on a constant is small however many patterns it has.
+///
+/// Its join cost would rank a selective multi-pattern body after a single broad pattern,
+/// e.g. `{ ex:c ex:p ?d . ?x ex:q ex:c . ?x ex:r ?y }` after `{ ?y a ex:C }`.
+fn estimate_service_size(inner: &GraphPattern, input_types: &VariableTypes) -> usize {
+    let mut sizes = Vec::new();
+    collect_entry_pattern_sizes(inner, input_types, &mut sizes);
+    sizes
+        .into_iter()
+        .min()
+        .unwrap_or_else(|| estimate_graph_pattern_size(inner, input_types))
+}
+
+/// The sizes of the patterns every solution of `pattern` matches: those of its joins,
+/// filters, extensions and left join left sides.
+fn collect_entry_pattern_sizes(
+    pattern: &GraphPattern,
+    input_types: &VariableTypes,
+    sizes: &mut Vec<usize>,
+) {
+    match pattern {
+        GraphPattern::QuadPattern { .. }
+        | GraphPattern::Path { .. }
+        | GraphPattern::Values { .. } => {
+            sizes.push(estimate_graph_pattern_size(pattern, input_types))
+        }
+        GraphPattern::Join { left, right, .. } => {
+            collect_entry_pattern_sizes(left, input_types, sizes);
+            collect_entry_pattern_sizes(right, input_types, sizes);
+        }
+        GraphPattern::LeftJoin { left, .. } => {
+            collect_entry_pattern_sizes(left, input_types, sizes)
+        }
+        GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
+            collect_entry_pattern_sizes(inner, input_types, sizes)
+        }
+        _ => sizes.push(estimate_graph_pattern_size(pattern, input_types)),
     }
 }
 
